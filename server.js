@@ -9,28 +9,34 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// In-memory storage for rate limiting and OTP
+// In-memory storage (in production, use database)
 const otpAttempts = new Map();
 const otpStore = new Map();
+const users = new Map(); // Will store all registered users
 
-// Sample data
-const users = [
-  {
-    mobile: "9876543210",
-    name: "राम शर्मा",
-    children: [
-      { name: "अर्जुन शर्मा", class: "5वीं", rollNo: "101", age: 10 },
-      { name: "सीता शर्मा", class: "3री", rollNo: "205", age: 8 }
-    ]
-  },
-  {
-    mobile: "9123456789",
-    name: "सुनीता देवी",
-    children: [
-      { name: "कृष्ण कुमार", class: "7वीं", rollNo: "301", age: 12 }
-    ]
-  }
-];
+// Initialize with sample data
+users.set("9876543210", {
+  mobile: "9876543210",
+  name: "राम शर्मा",
+  email: "ram@example.com",
+  address: "दिल्ली",
+  registeredAt: new Date().toISOString(),
+  children: [
+    { id: 1, name: "अर्जुन शर्मा", class: "5वीं", rollNo: "101", age: 10 },
+    { id: 2, name: "सीता शर्मा", class: "3री", rollNo: "205", age: 8 }
+  ]
+});
+
+users.set("9123456789", {
+  mobile: "9123456789",
+  name: "सुनीता देवी",
+  email: "sunita@example.com",
+  address: "मुंबई",
+  registeredAt: new Date().toISOString(),
+  children: [
+    { id: 3, name: "कृष्ण कुमार", class: "7वीं", rollNo: "301", age: 12 }
+  ]
+});
 
 // Root endpoint
 app.get('/', (req, res) => {
@@ -43,13 +49,91 @@ app.get('/', (req, res) => {
     status: "active",
     timestamp: new Date().toISOString(),
     twilioConfigured: twilioConfigured,
+    totalUsers: users.size,
     endpoints: [
+      "POST /api/signup",
       "POST /api/send-otp",
       "POST /api/verify-otp", 
       "GET /api/children/:mobile",
-      "POST /api/add-child"
+      "POST /api/add-child",
+      "GET /api/user/:mobile"
     ]
   });
+});
+
+// Signup endpoint
+app.post('/api/signup', (req, res) => {
+  try {
+    const { mobile, name, email, address } = req.body;
+
+    // Validation
+    if (!mobile || mobile.length !== 10) {
+      return res.status(400).json({
+        success: false,
+        message: 'कृपया 10 अंकों का मोबाइल नंबर दें'
+      });
+    }
+
+    if (!name || name.trim().length < 2) {
+      return res.status(400).json({
+        success: false,
+        message: 'कृपया अपना नाम दर्ज करें'
+      });
+    }
+
+    // Check if user already exists
+    if (users.has(mobile)) {
+      return res.status(400).json({
+        success: false,
+        message: 'यह मोबाइल नंबर पहले से registered है'
+      });
+    }
+
+    // Create new user
+    const newUser = {
+      mobile,
+      name: name.trim(),
+      email: email?.trim() || '',
+      address: address?.trim() || '',
+      registeredAt: new Date().toISOString(),
+      children: []
+    };
+
+    users.set(mobile, newUser);
+
+    return res.status(201).json({
+      success: true,
+      message: 'सफलतापूर्वक registration हो गई',
+      user: newUser
+    });
+
+  } catch (error) {
+    console.error('Signup Error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Registration में समस्या हुई'
+    });
+  }
+});
+
+// Check if user exists
+app.get('/api/user/:mobile', (req, res) => {
+  const { mobile } = req.params;
+  
+  if (users.has(mobile)) {
+    const user = users.get(mobile);
+    return res.json({
+      success: true,
+      exists: true,
+      user: user
+    });
+  } else {
+    return res.json({
+      success: true,
+      exists: false,
+      message: 'User not found'
+    });
+  }
 });
 
 // Send OTP endpoint with rate limiting
@@ -64,12 +148,19 @@ app.post('/api/send-otp', async (req, res) => {
       });
     }
 
+    // Check if user is registered
+    if (!users.has(mobile)) {
+      return res.status(404).json({
+        success: false,
+        message: 'यह मोबाइल नंबर registered नहीं है। कृपया पहले signup करें।'
+      });
+    }
+
     // RATE LIMITING CHECK
     const now = Date.now();
     const attemptKey = mobile;
     const lastAttempt = otpAttempts.get(attemptKey);
 
-    // Check if last OTP was sent within 2 minutes (120 seconds)
     if (lastAttempt && (now - lastAttempt) < 120000) {
       const waitTime = Math.ceil((120000 - (now - lastAttempt)) / 1000);
       return res.status(429).json({
@@ -116,12 +207,6 @@ app.post('/api/send-otp', async (req, res) => {
       expires: now + 300000 // 5 minutes
     });
 
-    // Clean up old attempts (keep only last 100)
-    if (otpAttempts.size > 100) {
-      const oldestKey = otpAttempts.keys().next().value;
-      otpAttempts.delete(oldestKey);
-    }
-
     return res.status(200).json({
       success: true,
       message: 'OTP सफलतापूर्वक भेजा गया',
@@ -147,6 +232,14 @@ app.post('/api/verify-otp', (req, res) => {
       return res.status(400).json({
         success: false,
         message: 'मोबाइल नंबर और OTP दोनों आवश्यक हैं'
+      });
+    }
+
+    // Check if user exists
+    if (!users.has(mobile)) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
       });
     }
 
@@ -180,15 +273,7 @@ app.post('/api/verify-otp', (req, res) => {
     // OTP verified successfully
     otpStore.delete(mobile);
     
-    // Find user data
-    const user = users.find(u => u.mobile === mobile);
-    
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'उपयोगकर्ता नहीं मिला'
-      });
-    }
+    const user = users.get(mobile);
 
     return res.status(200).json({
       success: true,
@@ -208,14 +293,15 @@ app.post('/api/verify-otp', (req, res) => {
 // Get children by mobile
 app.get('/api/children/:mobile', (req, res) => {
   const { mobile } = req.params;
-  const user = users.find(u => u.mobile === mobile);
   
-  if (!user) {
+  if (!users.has(mobile)) {
     return res.status(404).json({
       success: false,
       message: 'उपयोगकर्ता नहीं मिला'
     });
   }
+
+  const user = users.get(mobile);
 
   res.json({
     success: true,
@@ -235,17 +321,24 @@ app.post('/api/add-child', (req, res) => {
     });
   }
 
-  const user = users.find(u => u.mobile === mobile);
-  
-  if (!user) {
+  if (!users.has(mobile)) {
     return res.status(404).json({
       success: false,
       message: 'उपयोगकर्ता नहीं मिला'
     });
   }
 
-  user.children.push(child);
+  const user = users.get(mobile);
   
+  // Add unique ID to child
+  const newChild = {
+    ...child,
+    id: Date.now() // Simple ID generation
+  };
+  
+  user.children.push(newChild);
+  users.set(mobile, user); // Update user data
+
   res.json({
     success: true,
     message: 'बच्चा सफलतापूर्वक जोड़ा गया',
