@@ -1,138 +1,95 @@
 const express = require('express');
 const cors = require('cors');
-const bodyParser = require('body-parser');
-require('dotenv').config();
+const twilio = require('twilio');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+// Middleware
+app.use(cors());
+app.use(express.json());
 
-const otpStorage = new Map();
-const userStorage = new Map();
+// In-memory storage for rate limiting and OTP
+const otpAttempts = new Map();
+const otpStore = new Map();
 
-const twilio = require('twilio');
-let client;
-
-try {
-  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-    client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-    console.log('Twilio initialized successfully');
-  } else {
-    console.log('Twilio credentials not found - running in demo mode');
-  }
-} catch (error) {
-  console.log('Twilio initialization failed:', error.message);
-}
-
-const demoUsers = {
-  '9876543210': {
-    name: 'राजेश कुमार',
-    mobile: '9876543210',
+// Sample data
+const users = [
+  {
+    mobile: "9876543210",
+    name: "राम शर्मा",
     children: [
-      {
-        dsid: 'DSID240156',
-        name: 'आर्यन कुमार',
-        class: '7',
-        rollNumber: '156',
-        admissionId: 'ADM2024156',
-        dob: '2010-05-15',
-        gender: 'male',
-        bloodGroup: 'B+',
-        address: 'गांधी नगर, इंदौर',
-        fatherName: 'राजेश कुमार',
-        motherName: 'सुनीता कुमार',
-        status: 'active',
-        lastAttendance: '2024-01-15',
-        feeStatus: 'paid'
-      },
-      {
-        dsid: 'DSID240157',
-        name: 'प्रिया कुमार',
-        class: '6',
-        rollNumber: '157',
-        admissionId: 'ADM2024157',
-        dob: '2011-08-22',
-        gender: 'female',
-        bloodGroup: 'A+',
-        address: 'गांधी नगर, इंदौर',
-        fatherName: 'राजेश कुमार',
-        motherName: 'सुनीता कुमार',
-        status: 'active',
-        lastAttendance: '2024-01-15',
-        feeStatus: 'pending'
-      }
+      { name: "अर्जुन शर्मा", class: "5वीं", rollNo: "101", age: 10 },
+      { name: "सीता शर्मा", class: "3री", rollNo: "205", age: 8 }
     ]
   },
-  '9999999999': {
-    name: 'सुरेश शर्मा',
-    mobile: '9999999999',
+  {
+    mobile: "9123456789",
+    name: "सुनीता देवी",
     children: [
-      {
-        dsid: 'DSID240158',
-        name: 'अनिल शर्मा',
-        class: '8',
-        rollNumber: '158',
-        admissionId: 'ADM2024158',
-        dob: '2009-12-10',
-        gender: 'male',
-        bloodGroup: 'O+',
-        address: 'विजय नगर, इंदौर',
-        fatherName: 'सुरेश शर्मा',
-        motherName: 'गीता शर्मा',
-        status: 'active',
-        lastAttendance: '2024-01-15',
-        feeStatus: 'paid'
-      }
+      { name: "कृष्ण कुमार", class: "7वीं", rollNo: "301", age: 12 }
     ]
   }
-};
+];
 
+// Root endpoint
 app.get('/', (req, res) => {
-  res.json({ 
-    message: 'DS School Backend API is running!',
-    status: 'active',
+  const twilioConfigured = !!(process.env.TWILIO_ACCOUNT_SID && 
+                             process.env.TWILIO_AUTH_TOKEN && 
+                             process.env.TWILIO_PHONE_NUMBER);
+  
+  res.json({
+    message: "DS School Backend API is running!",
+    status: "active",
     timestamp: new Date().toISOString(),
-    twilioConfigured: !!client,
+    twilioConfigured: twilioConfigured,
     endpoints: [
-      'POST /api/send-otp',
-      'POST /api/verify-otp',
-      'GET /api/children/:mobile',
-      'POST /api/add-child'
+      "POST /api/send-otp",
+      "POST /api/verify-otp", 
+      "GET /api/children/:mobile",
+      "POST /api/add-child"
     ]
   });
 });
 
+// Send OTP endpoint with rate limiting
 app.post('/api/send-otp', async (req, res) => {
   try {
     const { mobile } = req.body;
-    
-    console.log('OTP request for mobile:', mobile);
-    
-    if (!mobile || !/^\d{10}$/.test(mobile)) {
+
+    if (!mobile || mobile.length !== 10) {
       return res.status(400).json({
         success: false,
-        message: 'कृपया 10 अंकों का सही मोबाइल नंबर दर्ज करें'
+        message: 'कृपया 10 अंकों का मोबाइल नंबर दें'
       });
     }
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    
-    otpStorage.set(mobile, {
-      otp: otp,
-      expires: Date.now() + 5 * 60 * 1000,
-      attempts: 0
-    });
+    // RATE LIMITING CHECK
+    const now = Date.now();
+    const attemptKey = mobile;
+    const lastAttempt = otpAttempts.get(attemptKey);
 
-    if (!client || !process.env.TWILIO_PHONE_NUMBER) {
-      console.log('Demo Mode - OTP:', otp);
-      return res.json({
+    // Check if last OTP was sent within 2 minutes (120 seconds)
+    if (lastAttempt && (now - lastAttempt) < 120000) {
+      const waitTime = Math.ceil((120000 - (now - lastAttempt)) / 1000);
+      return res.status(429).json({
+        success: false,
+        message: `कृपया ${waitTime} सेकंड बाद दोबारा कोशिश करें`,
+        waitTime: waitTime
+      });
+    }
+
+    // Generate 6-digit OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // Check if Twilio is configured
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    const twilioPhone = process.env.TWILIO_PHONE_NUMBER;
+
+    if (!accountSid || !authToken || !twilioPhone) {
+      // Demo mode
+      return res.status(200).json({
         success: true,
         message: 'OTP भेजा गया (Demo Mode)',
         demo: true,
@@ -140,49 +97,52 @@ app.post('/api/send-otp', async (req, res) => {
       });
     }
 
-    try {
-      const message = await client.messages.create({
-        body: `आपका DS School OTP है: ${otp}\n\nयह 5 मिनट में समाप्त हो जाएगा।\n\n- DS Middle School`,
-        from: process.env.TWILIO_PHONE_NUMBER,
-        to: `+91${mobile}`
-      });
+    // Send real SMS via Twilio
+    const client = twilio(accountSid, authToken);
+    
+    const message = await client.messages.create({
+      body: `DS School का OTP: ${otp}\nयह OTP 5 मिनट में expire हो जाएगा।`,
+      from: twilioPhone,
+      to: `+91${mobile}`
+    });
 
-      console.log(`OTP sent to ${mobile}, MessageSID: ${message.sid}`);
+    // Store attempt timestamp for rate limiting
+    otpAttempts.set(attemptKey, now);
 
-      res.json({
-        success: true,
-        message: 'OTP सफलतापूर्वक भेजा गया',
-        messageSid: message.sid
-      });
+    // Store OTP for verification
+    otpStore.set(mobile, {
+      otp: otp,
+      timestamp: now,
+      expires: now + 300000 // 5 minutes
+    });
 
-    } catch (twilioError) {
-      console.error('Twilio error:', twilioError.message);
-      
-      res.json({
-        success: true,
-        message: 'OTP भेजा गया (Demo Mode - Twilio Error)',
-        demo: true,
-        otp: otp,
-        error: twilioError.message
-      });
+    // Clean up old attempts (keep only last 100)
+    if (otpAttempts.size > 100) {
+      const oldestKey = otpAttempts.keys().next().value;
+      otpAttempts.delete(oldestKey);
     }
 
+    return res.status(200).json({
+      success: true,
+      message: 'OTP सफलतापूर्वक भेजा गया',
+      messageSid: message.sid
+    });
+
   } catch (error) {
-    console.error('Error sending OTP:', error);
-    res.status(500).json({
+    console.error('OTP Error:', error);
+    return res.status(500).json({
       success: false,
-      message: 'OTP भेजने में त्रुटि',
+      message: 'OTP भेजने में समस्या हुई',
       error: error.message
     });
   }
 });
 
-app.post('/api/verify-otp', async (req, res) => {
+// Verify OTP endpoint
+app.post('/api/verify-otp', (req, res) => {
   try {
     const { mobile, otp } = req.body;
-    
-    console.log('OTP verification for mobile:', mobile);
-    
+
     if (!mobile || !otp) {
       return res.status(400).json({
         success: false,
@@ -190,78 +150,39 @@ app.post('/api/verify-otp', async (req, res) => {
       });
     }
 
-    const storedOTP = otpStorage.get(mobile);
+    // Check stored OTP
+    const storedData = otpStore.get(mobile);
     
-    if (!storedOTP) {
+    if (!storedData) {
       return res.status(400).json({
         success: false,
-        message: 'OTP नहीं मिला या समय समाप्त'
+        message: 'OTP नहीं मिला। कृपया नया OTP भेजें।'
       });
     }
 
-    if (Date.now() > storedOTP.expires) {
-      otpStorage.delete(mobile);
+    // Check if OTP expired
+    if (Date.now() > storedData.expires) {
+      otpStore.delete(mobile);
       return res.status(400).json({
         success: false,
-        message: 'OTP का समय समाप्त हो गया'
+        message: 'OTP expire हो गया। कृपया नया OTP भेजें।'
       });
     }
 
-    if (storedOTP.attempts >= 3) {
-      otpStorage.delete(mobile);
+    // Verify OTP
+    if (storedData.otp !== otp) {
       return res.status(400).json({
         success: false,
-        message: 'बहुत अधिक प्रयास'
+        message: 'गलत OTP। कृपया सही OTP डालें।'
       });
     }
 
-    if (storedOTP.otp !== otp) {
-      storedOTP.attempts++;
-      return res.status(400).json({
-        success: false,
-        message: 'गलत OTP'
-      });
-    }
-
-    otpStorage.delete(mobile);
-
-    const user = demoUsers[mobile];
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'यह मोबाइल नंबर रजिस्टर नहीं है'
-      });
-    }
-
-    const sessionToken = `token_${mobile}_${Date.now()}`;
-    userStorage.set(sessionToken, user);
-
-    console.log('Login successful for:', user.name);
-
-    res.json({
-      success: true,
-      message: 'सफल लॉगिन',
-      user: user,
-      token: sessionToken
-    });
-
-  } catch (error) {
-    console.error('Error verifying OTP:', error);
-    res.status(500).json({
-      success: false,
-      message: 'OTP सत्यापन में त्रुटि',
-      error: error.message
-    });
-  }
-});
-
-app.get('/api/children/:mobile', (req, res) => {
-  try {
-    const { mobile } = req.params;
+    // OTP verified successfully
+    otpStore.delete(mobile);
     
-    console.log('Fetching children for mobile:', mobile);
+    // Find user data
+    const user = users.find(u => u.mobile === mobile);
     
-    const user = demoUsers[mobile];
     if (!user) {
       return res.status(404).json({
         success: false,
@@ -269,103 +190,72 @@ app.get('/api/children/:mobile', (req, res) => {
       });
     }
 
-    res.json({
+    return res.status(200).json({
       success: true,
-      children: user.children,
-      parent: {
-        name: user.name,
-        mobile: user.mobile
-      }
+      message: 'OTP सफलतापूर्वक verify हुआ',
+      user: user
     });
 
   } catch (error) {
-    console.error('Error fetching children:', error);
-    res.status(500).json({
+    console.error('Verify OTP Error:', error);
+    return res.status(500).json({
       success: false,
-      message: 'बच्चों की जानकारी लाने में त्रुटि',
-      error: error.message
+      message: 'OTP verify करने में समस्या हुई'
     });
   }
 });
 
+// Get children by mobile
+app.get('/api/children/:mobile', (req, res) => {
+  const { mobile } = req.params;
+  const user = users.find(u => u.mobile === mobile);
+  
+  if (!user) {
+    return res.status(404).json({
+      success: false,
+      message: 'उपयोगकर्ता नहीं मिला'
+    });
+  }
+
+  res.json({
+    success: true,
+    parent: user.name,
+    children: user.children
+  });
+});
+
+// Add child endpoint
 app.post('/api/add-child', (req, res) => {
-  try {
-    const { parentMobile, childData } = req.body;
-    
-    console.log('Adding child for parent:', parentMobile);
-    
-    if (!demoUsers[parentMobile]) {
-      return res.status(404).json({
-        success: false,
-        message: 'अभिभावक नहीं मिला'
-      });
-    }
-
-    const newDSID = `DSID${Date.now()}`;
-    const newChild = {
-      ...childData,
-      dsid: newDSID,
-      status: 'active',
-      lastAttendance: new Date().toISOString().split('T')[0],
-      feeStatus: 'pending'
-    };
-
-    demoUsers[parentMobile].children.push(newChild);
-
-    console.log('Child added successfully:', newChild.name);
-
-    res.json({
-      success: true,
-      message: 'नया बच्चा सफलतापूर्वक जोड़ा गया',
-      child: newChild
-    });
-
-  } catch (error) {
-    console.error('Error adding child:', error);
-    res.status(500).json({
+  const { mobile, child } = req.body;
+  
+  if (!mobile || !child) {
+    return res.status(400).json({
       success: false,
-      message: 'बच्चा जोड़ने में त्रुटि',
-      error: error.message
+      message: 'मोबाइल नंबर और बच्चे की जानकारी आवश्यक है'
     });
   }
-});
 
-app.use((err, req, res, next) => {
-  console.error('Server error:', err);
-  res.status(500).json({
-    success: false,
-    message: 'सर्वर त्रुटि',
-    error: err.message
+  const user = users.find(u => u.mobile === mobile);
+  
+  if (!user) {
+    return res.status(404).json({
+      success: false,
+      message: 'उपयोगकर्ता नहीं मिला'
+    });
+  }
+
+  user.children.push(child);
+  
+  res.json({
+    success: true,
+    message: 'बच्चा सफलतापूर्वक जोड़ा गया',
+    children: user.children
   });
 });
 
-app.use('*', (req, res) => {
-  res.status(404).json({
-    success: false,
-    message: 'API endpoint नहीं मिला',
-    requestedPath: req.originalUrl,
-    availableEndpoints: [
-      'GET /',
-      'POST /api/send-otp',
-      'POST /api/verify-otp',
-      'GET /api/children/:mobile',
-      'POST /api/add-child'
-    ]
-  });
-});
-
-const server = app.listen(PORT, () => {
-  console.log(`DS School Backend Server running on port ${PORT}`);
-  console.log(`Twilio configured: ${!!client}`);
-  console.log(`Health check: http://localhost:${PORT}/`);
-  console.log(`Demo users: ${Object.keys(demoUsers).length}`);
-});
-
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully');
-  server.close(() => {
-    console.log('Process terminated');
-  });
+// Start server
+app.listen(PORT, () => {
+  console.log(`DS School API running on port ${PORT}`);
 });
 
 module.exports = app;
